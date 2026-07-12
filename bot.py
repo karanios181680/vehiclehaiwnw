@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""
+Vehicle Information Bot - Full Database Credit System
+Version: 4.0.0 - COMPLETE DATABASE SYSTEM
+"""
+
+import os
+import re
+import time
+import json
+import logging
+import requests
+import random
+import string
+import sqlite3
+from datetime import datetime, timedelta
+import telebot
+from telebot import types
+
+# ==================== CONFIG ====================
+BOT_TOKEN = "8815661182:AAHMa-UX5hH0dmqgvgPuMGOf5797psYg6hk"
+ADMIN_IDS = [8935807032, 7934015451]
+
+# API Endpoints - HIDDEN
+API_ENDPOINTS = [
+    {"name": "Primary", "url": "http://161.248.163.233:1080/", "timeout": 10, "priority": 1},
+    {"name": "Backup", "url": "http://161.248.163.233:1081/", "timeout": 10, "priority": 2}
+]
+
+CODE_LENGTH = 12
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('vehicle_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Initialize bot
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# ==================== DATABASE CLASS ====================
+
+class Database:
+    def __init__(self, db_file="vehicle_bot.db"):
+        self.db_file = db_file
+        self.init_db()
+    
+    def get_connection(self):
+        """Get database connection"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_db(self):
+        """Initialize all tables"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        
+        # Users table
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            credit_expiry TEXT,
+            is_active INTEGER DEFAULT 0,
+            created_at TEXT,
+            last_used TEXT
+        )''')
+        
+        # Codes table - FULL STORAGE
+        c.execute('''CREATE TABLE IF NOT EXISTS codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            created_by INTEGER,
+            hours INTEGER,
+            used_by INTEGER,
+            used_at TEXT,
+            created_at TEXT,
+            is_used INTEGER DEFAULT 0,
+            expiry_time TEXT
+        )''')
+        
+        # Admins table
+        c.execute('''CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY
+        )''')
+        
+        # Add admins
+        for admin_id in ADMIN_IDS:
+            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (admin_id,))
+        
+        # Usage logs
+        c.execute('''CREATE TABLE IF NOT EXISTS usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            vehicle_number TEXT,
+            api_used TEXT,
+            timestamp TEXT
+        )''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized with all tables")
+    
+    # ==================== USER METHODS ====================
+    
+    def get_user(self, user_id):
+        """Get user data"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result
+    
+    def create_user(self, user_id, username, first_name):
+        """Create new user"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, username, first_name, now))
+        conn.commit()
+        conn.close()
+    
+    def update_credit(self, user_id, hours):
+        """Update user credit with expiry"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        expiry = (datetime.now() + timedelta(hours=hours)).isoformat()
+        c.execute('''
+            UPDATE users 
+            SET credit_expiry = ?, is_active = 1, last_used = ?
+            WHERE user_id = ?
+        ''', (expiry, datetime.now().isoformat(), user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Credit updated: User {user_id} - {hours} hours - Expires: {expiry}")
+    
+    def check_credit(self, user_id):
+        """Check if user has valid credit"""
+        # Admin check
+        if self.is_admin(user_id):
+            return True
+        
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT credit_expiry, is_active FROM users WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        
+        if not result:
+            return False
+        
+        expiry_str, is_active = result
+        if not expiry_str or not is_active:
+            return False
+        
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+            return datetime.now() < expiry
+        except:
+            return False
+    
+    def get_credit_info(self, user_id):
+        """Get formatted credit info"""
+        if self.is_admin(user_id):
+            return "Unlimited (Admin)"
+        
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT credit_expiry FROM users WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        
+        if not result or not result[0]:
+            return "No active credit"
+        
+        try:
+            expiry = datetime.fromisoformat(result[0])
+            remaining = (expiry - datetime.now()).total_seconds()
+            
+            if remaining <= 0:
+                return "Expired"
+            
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            return f"{hours}h {minutes}m remaining"
+        except:
+            return "Invalid credit data"
+    
+    def is_admin(self, user_id):
+        """Check if user is admin"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result is not None
+    
+    # ==================== CODE METHODS ====================
+    
+    def generate_code(self, hours=24):
+        """Generate unique code"""
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=CODE_LENGTH))
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM codes WHERE code = ?', (code,))
+        while c.fetchone():
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=CODE_LENGTH))
+            c.execute('SELECT 1 FROM codes WHERE code = ?', (code,))
+        conn.close()
+        return code
+    
+    def save_code(self, code, created_by, hours=24):
+        """Save code to database with full details"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        expiry = (datetime.now() + timedelta(hours=hours)).isoformat()
+        
+        c.execute('''
+            INSERT INTO codes (code, created_by, hours, created_at, expiry_time, is_used)
+            VALUES (?, ?, ?, ?, ?, 0)
+        ''', (code, created_by, hours, now, expiry))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Code saved: {code} - {hours} hours - Expires: {expiry}")
+        return True
+    
+    def redeem_code(self, code, user_id):
+        """Redeem a code - FULL VERIFICATION"""
+        code = code.upper().strip()
+        
+        conn = self.get_connection()
+        c = conn.cursor()
+        
+        # Check if code exists
+        c.execute('SELECT code, hours, is_used, used_by, created_at, expiry_time FROM codes WHERE code = ?', (code,))
+        result = c.fetchone()
+        
+        if not result:
+            conn.close()
+            logger.warning(f"❌ Code not found: {code}")
+            return False, "Invalid code"
+        
+        code_val, hours, is_used, used_by, created_at, expiry_time = result
+        
+        # Check if already used
+        if is_used == 1:
+            conn.close()
+            logger.warning(f"❌ Code already used: {code} by {used_by}")
+            return False, "Code already used"
+        
+        # Check if expired
+        try:
+            expiry = datetime.fromisoformat(expiry_time)
+            if datetime.now() > expiry:
+                conn.close()
+                logger.warning(f"❌ Code expired: {code}")
+                return False, "Code expired"
+        except:
+            pass
+        
+        # Redeem code - UPDATE
+        now = datetime.now().isoformat()
+        c.execute('''
+            UPDATE codes 
+            SET used_by = ?, used_at = ?, is_used = 1 
+            WHERE code = ?
+        ''', (user_id, now, code))
+        
+        # Update user credit
+        self.update_credit(user_id, hours)
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Code redeemed: {code} by user {user_id} - {hours} hours")
+        return True, f"✅ Code redeemed! {hours} hours added. Expires: {datetime.now() + timedelta(hours=hours)}"
+    
+    def get_all_codes(self, limit=50):
+        """Get all codes with details"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT code, hours, is_used, used_by, created_at, expiry_time 
+            FROM codes 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        ''', (limit,))
+        results = c.fetchall()
+        conn.close()
+        return results
+    
+    def get_user_codes(self, user_id):
+        """Get codes used by a user"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT code, hours, used_at, expiry_time 
+            FROM codes 
+            WHERE used_by = ?
+            ORDER BY used_at DESC
+        ''', (user_id,))
+        results = c.fetchall()
+        conn.close()
+        return results
+    
+    def log_usage(self, user_id, vehicle_number, api_used="Unknown"):
+        """Log user usage"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute('''
+            INSERT INTO usage_logs (user_id, vehicle_number, api_used, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, vehicle_number, api_used, now))
+        conn.commit()
+        conn.close()
+
+# Initialize database
+db = Database()
+
+# ==================== VEHICLE API CLASS ====================
+
+class VehicleAPI:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Connection': 'keep-alive'
+        })
+    
+    def fetch_from_api(self, vehicle_number, endpoint):
+        try:
+            vehicle_number = vehicle_number.upper().strip().replace(" ", "")
+            url = f"{endpoint['url']}{vehicle_number}"
+            
+            response = self.session.get(url, timeout=endpoint['timeout'])
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    return {'success': True, 'data': data}
+                except json.JSONDecodeError:
+                    return {'success': True, 'data': response.text, 'is_json': False}
+            else:
+                return {'success': False, 'error': f"HTTP {response.status_code}"}
+                
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def fetch_vehicle_data(self, vehicle_number):
+        for endpoint in API_ENDPOINTS:
+            result = self.fetch_from_api(vehicle_number, endpoint)
+            if result.get('success'):
+                logger.info(f"✅ Vehicle data fetched")
+                return result
+            else:
+                logger.warning(f"❌ API failed")
+        
+        return {'success': False, 'error': "Service unavailable. Please try again later."}
+    
+    def format_vehicle_data(self, result):
+        if not result.get('success'):
+            return f"❌ Error: {result.get('error', 'Unknown error')}"
+        
+        data = result.get('data')
+        
+        output = f"🚗 VEHICLE INFORMATION\n"
+        output += f"📅 {datetime.now().strftime('%d-%m-%Y %H:%M')}\n"
+        output += "─" * 30 + "\n\n"
+        
+        if isinstance(data, dict):
+            if 'response' in data and isinstance(data['response'], dict):
+                data = data['response']
+                if 'result' in data and isinstance(data['result'], dict):
+                    data = data['result']
+            
+            if 'vehicle' in data:
+                vehicle_data = data['vehicle']
+                if isinstance(vehicle_data, list) and len(vehicle_data) > 0:
+                    if isinstance(vehicle_data[0], dict):
+                        data = vehicle_data[0]
+                        if 'response' in data and 'result' in data['response']:
+                            data = data['response']['result']
+            
+            if 'insurance' in data and isinstance(data['insurance'], dict):
+                ins = data['insurance']
+                for k, v in ins.items():
+                    if v and v != "NA" and v != "N/A":
+                        output += f"📄 {k.replace('_', ' ').title()}: {v}\n"
+                output += "\n"
+            
+            for key, value in data.items():
+                if value and value != "NA" and value != "N/A" and value != "null":
+                    if isinstance(value, (dict, list)):
+                        continue
+                    clean_key = key.replace('_', ' ').title()
+                    output += f"🔹 {clean_key}: {value}\n"
+            
+            if len(output) < 100:
+                try:
+                    formatted_json = json.dumps(data, indent=2, ensure_ascii=False)
+                    if len(formatted_json) > 4000:
+                        formatted_json = formatted_json[:4000] + "\n... (truncated)"
+                    output += f"📋 Raw Data:\n```\n{formatted_json}\n```"
+                except:
+                    output += str(data)[:4000]
+        
+        elif isinstance(data, str):
+            output += data[:4000]
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                    output += f"📌 Item {i+1}:\n"
+                    for k, v in item.items():
+                        if v and v != "NA" and v != "N/A":
+                            output += f"   {k}: {v}\n"
+                    output += "\n"
+                else:
+                    output += f"📌 {item}\n"
+        else:
+            output += str(data)[:4000]
+        
+        output += "\n" + "─" * 30 + "\n"
+        output += "✅ Data fetched successfully"
+        
+        return output
+
+vehicle_api = VehicleAPI()
+
+# ==================== CREDIT CHECK ====================
+
+def require_credit(func):
+    def wrapper(message, *args, **kwargs):
+        user_id = message.from_user.id
+        
+        if db.is_admin(user_id):
+            return func(message, *args, **kwargs)
+        
+        if db.check_credit(user_id):
+            return func(message, *args, **kwargs)
+        
+        bot.reply_to(
+            message,
+            "❌ No active credit found!\n\n"
+            "📌 Use /redeem [CODE] to activate.\n\n"
+            "🔹 Example: /redeem ABC123XYZ789\n\n"
+            "📌 Contact admin to purchase credit."
+        )
+        return None
+    return wrapper
+
+# ==================== BOT COMMANDS ====================
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or "Unknown"
+    first_name = message.from_user.first_name or "User"
+    
+    db.create_user(user_id, username, first_name)
+    
+    welcome_text = """
+🚗 VEHICLE INFORMATION BOT v4.0
+
+🔹 Full Database Credit System
+🔹 Vehicle lookup service
+
+📌 Commands:
+/redeem [CODE] - Activate your credit
+/credit - Check your credit status
+/vehicle [NUMBER] - Get vehicle info
+
+🔹 Example:
+/redeem ABC123XYZ789
+/vehicle HR26EV0001
+"""
+    
+    if db.is_admin(user_id):
+        welcome_text += "\n\n✅ You are ADMIN - Unlimited access!"
+    elif db.check_credit(user_id):
+        credit_info = db.get_credit_info(user_id)
+        welcome_text += f"\n\n✅ Active credit: {credit_info}"
+    else:
+        welcome_text += "\n\n❌ No active credit. Use /redeem [CODE]"
+    
+    bot.reply_to(message, welcome_text)
+
+@bot.message_handler(commands=['redeem'])
+def cmd_redeem(message):
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "❌ Usage: /redeem [CODE]\n\n"
+            "📌 Example: /redeem ABC123XYZ789"
+        )
+        return
+    
+    code = parts[1].strip().upper()
+    user_id = message.from_user.id
+    
+    logger.info(f"🔄 Redeem attempt: {code} by user {user_id}")
+    
+    success, msg = db.redeem_code(code, user_id)
+    
+    if success:
+        bot.reply_to(
+            message,
+            f"{msg}\n\n"
+            f"📌 Now use /vehicle [NUMBER]"
+        )
+    else:
+        bot.reply_to(message, f"❌ {msg}")
+
+@bot.message_handler(commands=['credit'])
+def cmd_credit(message):
+    user_id = message.from_user.id
+    
+    if db.is_admin(user_id):
+        bot.reply_to(
+            message,
+            "👑 ADMIN ACCESS\n\n"
+            "✅ Unlimited credit - No expiry\n"
+            "📌 Use /create [HOURS] to create codes"
+        )
+        return
+    
+    credit_info = db.get_credit_info(user_id)
+    
+    if "remaining" in credit_info:
+        status = "✅ Active"
+    elif "Expired" in credit_info:
+        status = "❌ Expired"
+    else:
+        status = "❌ No credit"
+    
+    response = f"💳 CREDIT STATUS\n\n"
+    response += f"📌 Status: {status}\n"
+    response += f"📌 Details: {credit_info}\n\n"
+    
+    if not db.check_credit(user_id):
+        response += "🔹 Use /redeem [CODE] to activate"
+    
+    bot.reply_to(message, response)
+
+@bot.message_handler(commands=['create'])
+def cmd_create(message):
+    user_id = message.from_user.id
+    
+    if not db.is_admin(user_id):
+        bot.reply_to(message, "❌ Admin only command.")
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "❌ Usage: /create [HOURS]\n\n"
+            "📌 Example:\n"
+            "/create 24 - 24-hour credit\n"
+            "/create 48 - 48-hour credit"
+        )
+        return
+    
+    try:
+        hours = int(parts[1])
+        if hours < 1:
+            bot.reply_to(message, "❌ Hours must be greater than 0")
+            return
+    except ValueError:
+        bot.reply_to(message, "❌ Enter valid number of hours")
+        return
+    
+    code = db.generate_code(hours)
+    db.save_code(code, user_id, hours)
+    
+    # Get all codes to show total
+    all_codes = db.get_all_codes(limit=5)
+    total_codes = len(all_codes)
+    
+    bot.reply_to(
+        message,
+        f"✅ CODE CREATED!\n\n"
+        f"📌 Code: `{code}`\n"
+        f"⏱ Hours: {hours}\n"
+        f"📅 Created: {datetime.now().strftime('%d-%m-%Y %H:%M')}\n"
+        f"⏰ Expires: {(datetime.now() + timedelta(hours=hours)).strftime('%d-%m-%Y %H:%M')}\n\n"
+        f"🔹 User can redeem:\n"
+        f"/redeem {code}\n\n"
+        f"📊 Total codes: {total_codes}"
+    )
+    
+    logger.info(f"Admin {user_id} created code {code} for {hours} hours")
+
+@bot.message_handler(commands=['codes'])
+def cmd_codes(message):
+    user_id = message.from_user.id
+    
+    if not db.is_admin(user_id):
+        bot.reply_to(message, "❌ Admin only command.")
+        return
+    
+    results = db.get_all_codes(limit=30)
+    
+    if not results:
+        bot.reply_to(message, "📌 No codes created yet.")
+        return
+    
+    response = "📋 **ALL CODES**\n\n"
+    
+    for row in results:
+        code = row['code']
+        hours = row['hours']
+        is_used = row['is_used']
+        used_by = row['used_by']
+        created_at = row['created_at']
+        expiry_time = row['expiry_time']
+        
+        status = "✅ Used" if is_used else "🔹 Active"
+        if is_used:
+            status += f" (User: {used_by})"
+        
+        response += f"📌 `{code}` - {hours}h - {status}\n"
+        response += f"   Created: {created_at[:10]} {created_at[11:16]}\n"
+        response += f"   Expires: {expiry_time[:10]} {expiry_time[11:16]}\n\n"
+    
+    response += f"\n📊 Total codes: {len(results)}"
+    
+    bot.reply_to(message, response)
+
+@bot.message_handler(commands=['vehicle'])
+@require_credit
+def cmd_vehicle(message):
+    try:
+        parts = message.text.split(maxsplit=1)
+        
+        if len(parts) < 2:
+            bot.reply_to(message, "❌ Enter vehicle number.\nExample: /vehicle HR26EV0001")
+            return
+        
+        vehicle_number = parts[1].strip().upper().replace(" ", "")
+        
+        if not vehicle_number:
+            bot.reply_to(message, "❌ Enter valid vehicle number.")
+            return
+        
+        loading = bot.reply_to(message, f"🔍 Searching: {vehicle_number}\n⏳ Please wait...")
+        
+        result = vehicle_api.fetch_vehicle_data(vehicle_number)
+        formatted = vehicle_api.format_vehicle_data(result)
+        
+        bot.edit_message_text(formatted, chat_id=message.chat.id, message_id=loading.message_id)
+        
+        # Log usage
+        db.log_usage(message.from_user.id, vehicle_number, result.get('api', 'Unknown'))
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)[:100]}")
+
+@bot.message_handler(commands=['mycodes'])
+def cmd_my_codes(message):
+    """User can see their redeemed codes"""
+    user_id = message.from_user.id
+    results = db.get_user_codes(user_id)
+    
+    if not results:
+        bot.reply_to(message, "📌 You haven't redeemed any codes yet.")
+        return
+    
+    response = "📋 **YOUR REDEEMED CODES**\n\n"
+    
+    for row in results:
+        code = row['code']
+        hours = row['hours']
+        used_at = row['used_at']
+        expiry_time = row['expiry_time']
+        
+        response += f"📌 `{code}` - {hours}h\n"
+        response += f"   Used: {used_at[:10]} {used_at[11:16]}\n"
+        response += f"   Expires: {expiry_time[:10]} {expiry_time[11:16]}\n\n"
+    
+    bot.reply_to(message, response)
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    try:
+        text = message.text.strip().upper().replace(" ", "")
+        
+        # Check if it's a vehicle number
+        if re.match(r'^[A-Z]{2}\d{1,2}[A-Z]{1,2}\d{4}$', text):
+            if not db.is_admin(message.from_user.id) and not db.check_credit(message.from_user.id):
+                bot.reply_to(message, "❌ No active credit! Use /redeem [CODE]")
+                return
+            
+            loading = bot.reply_to(message, f"🔍 Searching: {text}\n⏳ Please wait...")
+            
+            result = vehicle_api.fetch_vehicle_data(text)
+            formatted = vehicle_api.format_vehicle_data(result)
+            
+            bot.edit_message_text(formatted, chat_id=message.chat.id, message_id=loading.message_id)
+            db.log_usage(message.from_user.id, text, result.get('api', 'Unknown'))
+        else:
+            bot.reply_to(message, "❓ Unknown command.\nUse /start to see commands")
+            
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+
+# ==================== MAIN ====================
+
+def main():
+    # Initialize database
+    db.init_db()
+    
+    # Create a test code for admin
+    test_code = db.generate_code(24)
+    db.save_code(test_code, ADMIN_IDS[0], 24)
+    
+    print("""
+    ╔═══════════════════════════════════════════════╗
+    ║   VEHICLE BOT v4.0 - FULL DATABASE           ║
+    ║   - All codes stored in database             ║
+    ║   - Full expiry tracking                     ║
+    ║   - Usage logs                              ║
+    ║   - Admin complete control                   ║
+    ╚═══════════════════════════════════════════════╝
+    """)
+    
+    print(f"✅ Bot starting...")
+    print(f"✅ Admins: {ADMIN_IDS}")
+    print(f"✅ Test code: {test_code}")
+    print(f"✅ To test: /redeem {test_code}")
+    print(f"✅ All data stored in vehicle_bot.db")
+    
+    try:
+        bot.remove_webhook()
+        bot.polling(none_stop=True, interval=1, timeout=60)
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        time.sleep(5)
+        main()
+
+if __name__ == "__main__":
+    main()
